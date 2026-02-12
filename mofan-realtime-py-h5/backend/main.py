@@ -63,34 +63,53 @@ async def websocket_endpoint(websocket: WebSocket):
             async with session.ws_connect(final_ws_url, headers=headers) as stepfun_ws:
                 print("Connected to Stepfun")
 
+                stop_event = asyncio.Event()
+
                 async def forward_to_client():
                     try:
                         async for msg in stepfun_ws:
+                            if stop_event.is_set():
+                                break
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 await websocket.send_text(msg.data)
                             elif msg.type == aiohttp.WSMsgType.BINARY:
                                 await websocket.send_bytes(msg.data)
-                            elif msg.type == aiohttp.WSMsgType.CLOSED:
-                                break
-                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
                     except Exception as e:
-                        print(f"Error forwarding to client: {e}")
+                        if not stop_event.is_set():
+                            print(f"Error forwarding to client: {e}")
+                    finally:
+                        stop_event.set()
 
                 async def forward_to_stepfun():
                     try:
-                        while True:
-                            message = await websocket.receive()
-                            if "text" in message:
-                                await stepfun_ws.send_str(message["text"])
-                            elif "bytes" in message:
-                                await stepfun_ws.send_bytes(message["bytes"])
-                            elif message["type"] == "websocket.disconnect":
-                                break
+                        while not stop_event.is_set():
+                            try:
+                                message = await asyncio.wait_for(websocket.receive(), timeout=1.0)
+                                if "text" in message:
+                                    await stepfun_ws.send_str(message["text"])
+                                elif "bytes" in message:
+                                    await stepfun_ws.send_bytes(message["bytes"])
+                                elif message["type"] == "websocket.disconnect":
+                                    break
+                            except asyncio.TimeoutError:
+                                continue
                     except Exception as e:
-                        print(f"Error forwarding to Stepfun: {e}")
+                        if not stop_event.is_set():
+                            print(f"Error forwarding to Stepfun: {e}")
+                    finally:
+                        stop_event.set()
 
-                await asyncio.gather(forward_to_client(), forward_to_stepfun())
+                # Use wait to run both and cancel the other when one finishes
+                done, pending = await asyncio.wait(
+                    [asyncio.create_task(forward_to_client()), asyncio.create_task(forward_to_stepfun())],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                stop_event.set()
+                for task in pending:
+                    task.cancel()
 
     except Exception as e:
         print(f"Connection error: {e}")

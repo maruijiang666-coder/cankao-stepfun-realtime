@@ -39,6 +39,8 @@
         .btn-primary:hover { background-color: #0062cc; }
         .btn-danger { background-color: #ff3b30; color: white; }
         .btn-danger:hover { background-color: #d70015; }
+        .btn-success { background-color: #34c759; color: white; }
+        .btn-success:hover { background-color: #28a745; }
         .btn:disabled { background-color: #ccc; cursor: not-allowed; }
         
         .status {
@@ -121,6 +123,7 @@
     
     <div class="controls">
         <input type="password" id="apiKey" placeholder="Stepfun API Key">
+        <button id="realtimeBtn" class="btn btn-success">Realtime Talk (One-Click)</button>
         <button id="connectBtn" class="btn btn-primary">Connect</button>
         <button id="vadBtn" class="btn btn-primary" disabled>Start VAD Mode</button>
     </div>
@@ -135,6 +138,7 @@
 <script>
     const connectBtn = document.getElementById('connectBtn');
     const vadBtn = document.getElementById('vadBtn');
+    const realtimeBtn = document.getElementById('realtimeBtn');
     const apiKeyInput = document.getElementById('apiKey');
     const statusDiv = document.getElementById('status');
     const aiCircle = document.getElementById('aiCircle');
@@ -148,6 +152,7 @@
     let microphoneStream = null;
     let isVADActive = false;
     let currentAiTranscriptSpan = null;
+    let autoStartVAD = false;
 
     function log(msg) {
         const p = document.createElement('p');
@@ -287,13 +292,18 @@
         currentAiTranscriptSpan = null; 
     }
 
-    connectBtn.onclick = async () => {
+    async function connect() {
         if (ws) {
             ws.close();
             return;
         }
 
         const apiKey = apiKeyInput.value;
+        if (!apiKey) {
+            alert("Please enter Stepfun API Key");
+            autoStartVAD = false; // Reset if failed
+            return;
+        }
         const url = `ws://localhost:8080/ws?apiKey=${apiKey}`;
         
         ws = new WebSocket(url);
@@ -302,9 +312,16 @@
             statusDiv.textContent = "Connected";
             statusDiv.className = "status status-connected";
             connectBtn.textContent = "Disconnect";
+            realtimeBtn.textContent = "Stop Realtime Talk";
+            realtimeBtn.className = "btn btn-danger";
             vadBtn.disabled = false;
             log("Connected to proxy server");
             await initAudio();
+
+            if (autoStartVAD) {
+                await startVADMode();
+                autoStartVAD = false;
+            }
         };
         
         ws.onmessage = async (event) => {
@@ -379,45 +396,77 @@
             statusDiv.textContent = "Disconnected";
             statusDiv.className = "status status-disconnected";
             connectBtn.textContent = "Connect";
+            realtimeBtn.textContent = "Realtime Talk (One-Click)";
+            realtimeBtn.className = "btn btn-success";
             vadBtn.disabled = true;
             vadBtn.textContent = "Start VAD Mode";
             isVADActive = false;
             stopRecording();
+            interruptAudio();
             ws = null;
             log("Disconnected from proxy server");
         };
+    }
+
+    connectBtn.onclick = connect;
+
+    realtimeBtn.onclick = async () => {
+        if (ws) {
+            // 1. Stop VAD if active
+            if (isVADActive) {
+                stopVADMode();
+            }
+            // 2. Stop audio and recording immediately
+            stopRecording();
+            interruptAudio();
+            // 3. Close WebSocket
+            ws.close();
+        } else {
+            autoStartVAD = true;
+            await connect();
+        }
     };
+
+    async function startVADMode() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        
+        ws.send(JSON.stringify({
+            type: 'session.update',
+            session: {
+                modalities: ["text", "audio"],
+                turn_detection: { type: 'server_vad' },
+                input_audio_transcription: { model: 'whisper-1' },
+                instructions: "You are a helpful assistant. Keep your responses concise and friendly."
+            }
+        }));
+        await startRecording();
+        isVADActive = true;
+        vadBtn.textContent = "Stop VAD Mode";
+        vadBtn.className = "btn btn-danger";
+        log("VAD Mode enabled");
+    }
+
+    function stopVADMode() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        ws.send(JSON.stringify({
+            type: 'session.update',
+            session: {
+                turn_detection: null
+            }
+        }));
+        stopRecording();
+        isVADActive = false;
+        vadBtn.textContent = "Start VAD Mode";
+        vadBtn.className = "btn btn-primary";
+        log("VAD Mode disabled");
+    }
 
     vadBtn.onclick = async () => {
         if (!isVADActive) {
-            // Start VAD
-            ws.send(JSON.stringify({
-                type: 'session.update',
-                session: {
-                    modalities: ["text", "audio"],
-                    turn_detection: { type: 'server_vad' },
-                    input_audio_transcription: { model: 'whisper-1' },
-                    instructions: "You are a helpful assistant. Keep your responses concise and friendly."
-                }
-            }));
-            await startRecording();
-            isVADActive = true;
-            vadBtn.textContent = "Stop VAD Mode";
-            vadBtn.className = "btn btn-danger";
-            log("VAD Mode enabled");
+            await startVADMode();
         } else {
-            // Stop VAD
-            ws.send(JSON.stringify({
-                type: 'session.update',
-                session: {
-                    turn_detection: null
-                }
-            }));
-            stopRecording();
-            isVADActive = false;
-            vadBtn.textContent = "Start VAD Mode";
-            vadBtn.className = "btn btn-primary";
-            log("VAD Mode disabled");
+            stopVADMode();
         }
     };
 </script>
