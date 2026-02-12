@@ -131,6 +131,7 @@
     <div class="log" id="log"></div>
 </div>
 
+<script src="wav-stream-player.js"></script>
 <script>
     const connectBtn = document.getElementById('connectBtn');
     const vadBtn = document.getElementById('vadBtn');
@@ -143,12 +144,9 @@
     let ws = null;
     let audioContext = null;
     let audioWorkletNode = null;
+    let wavStreamPlayer = null;
     let microphoneStream = null;
     let isVADActive = false;
-    let playbackBuffer = [];
-    let isPlaying = false;
-    let nextStartTime = 0;
-    let activeSources = [];
     let currentAiTranscriptSpan = null;
 
     function log(msg) {
@@ -196,6 +194,10 @@
         }
         if (audioContext.state === 'suspended') {
             await audioContext.resume();
+        }
+        if (!wavStreamPlayer) {
+            wavStreamPlayer = new WavStreamPlayer({ sampleRate: 24000 });
+            await wavStreamPlayer.connect();
         }
     }
 
@@ -264,54 +266,25 @@
         }
     }
 
-    function playAudioChunk(base64Audio) {
+    function playAudioChunk(base64Audio, trackId = 'default') {
         const arrayBuffer = base64ToArrayBuffer(base64Audio);
         if (arrayBuffer.byteLength === 0) return;
         
-        const int16Data = new Int16Array(arrayBuffer);
-        const float32Data = new Float32Array(int16Data.length);
-        
-        for (let i = 0; i < int16Data.length; i++) {
-            float32Data[i] = int16Data[i] / 32768.0;
-        }
-        
-        const audioBuffer = audioContext.createBuffer(1, float32Data.length, 24000);
-        audioBuffer.getChannelData(0).set(float32Data);
-        
-        const source = audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(audioContext.destination);
-        
-        const currentTime = audioContext.currentTime;
-        if (nextStartTime < currentTime) {
-            nextStartTime = currentTime;
-        }
-        
-        source.start(nextStartTime);
-        nextStartTime += audioBuffer.duration;
-        
-        activeSources.push(source);
+        console.log(`Playing audio chunk: ${arrayBuffer.byteLength} bytes`);
+        wavStreamPlayer.add16BitPCM(arrayBuffer, trackId);
         aiCircle.classList.add('ai-speaking');
         
-        source.onended = () => {
-            activeSources = activeSources.filter(s => s !== source);
-            if (activeSources.length === 0) {
-                aiCircle.classList.remove('ai-speaking');
-            }
-        };
+        // We can't easily know when the stream ends with WavStreamPlayer 
+        // without complex tracking, but we can clear it on response.done or interruption.
     }
 
     function interruptAudio() {
         log("Interrupting audio playback...");
-        activeSources.forEach(source => {
-            try {
-                source.stop();
-            } catch (e) {}
-        });
-        activeSources = [];
-        nextStartTime = audioContext.currentTime;
+        if (wavStreamPlayer) {
+            wavStreamPlayer.interrupt();
+        }
         aiCircle.classList.remove('ai-speaking');
-        currentAiTranscriptSpan = null; // Also reset transcript on interruption
+        currentAiTranscriptSpan = null; 
     }
 
     connectBtn.onclick = async () => {
@@ -325,13 +298,13 @@
         
         ws = new WebSocket(url);
         
-        ws.onopen = () => {
+        ws.onopen = async () => {
             statusDiv.textContent = "Connected";
             statusDiv.className = "status status-connected";
             connectBtn.textContent = "Disconnect";
             vadBtn.disabled = false;
             log("Connected to proxy server");
-            initAudio();
+            await initAudio();
         };
         
         ws.onmessage = async (event) => {
@@ -351,11 +324,13 @@
             }
             
             // Handle audio deltas
-            if (data.type === 'response.audio.delta' && data.audio) {
-                playAudioChunk(data.audio);
+            const isAudioDelta = data.type === 'response.audio.delta' || data.type === 'server.response.audio.delta';
+            if (isAudioDelta && (data.delta || data.audio)) {
+                const audioData = data.delta || data.audio;
+                playAudioChunk(audioData, data.item_id);
             } 
             // Handle interruption
-            else if (data.type === 'server.input_audio_buffer.speech_started') {
+            else if (data.type === 'server.input_audio_buffer.speech_started' || data.type === 'input_audio_buffer.speech_started') {
                 log("User started speaking (Interruption detected)");
                 interruptAudio();
             } 
@@ -371,6 +346,7 @@
             else if (data.type === 'response.done') {
                 log("Response finished");
                 currentAiTranscriptSpan = null; // Reset for next response
+                aiCircle.classList.remove('ai-speaking');
             }
             // Handle new response creation
             else if (data.type === 'response.created') {
@@ -389,7 +365,9 @@
                     'session.updated',
                     'response.created',
                     'response.output_item.added',
-                    'conversation.item.created'
+                    'conversation.item.created',
+                    'response.audio.delta',
+                    'server.response.audio.delta'
                 ];
                 if (interestingEvents.includes(data.type)) {
                     log("Event: " + data.type);
