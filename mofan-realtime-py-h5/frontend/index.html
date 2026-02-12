@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stepfun Realtime VAD Demo</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f5f7f9;
+        }
+        .container {
+            background: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            width: 90%;
+            max-width: 500px;
+            text-align: center;
+        }
+        h1 { margin-top: 0; color: #333; }
+        .controls { margin: 20px 0; display: flex; flex-direction: column; gap: 10px; }
+        .btn {
+            padding: 12px 24px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-weight: 600;
+        }
+        .btn-primary { background-color: #007aff; color: white; }
+        .btn-primary:hover { background-color: #0062cc; }
+        .btn-danger { background-color: #ff3b30; color: white; }
+        .btn-danger:hover { background-color: #d70015; }
+        .btn:disabled { background-color: #ccc; cursor: not-allowed; }
+        
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        .status-connected { background-color: #e1f5fe; color: #01579b; }
+        .status-disconnected { background-color: #ffebee; color: #b71c1c; }
+        
+        .ai-circle {
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            margin: 20px auto;
+            background: linear-gradient(135deg, #ff9a9e 0%, #fad0c4 99%, #fad0c4 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        .ai-speaking {
+            transform: scale(1.1);
+            box-shadow: 0 0 20px rgba(255, 154, 158, 0.6);
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1.1); }
+            50% { transform: scale(1.2); }
+            100% { transform: scale(1.1); }
+        }
+        
+        input {
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .log {
+            margin-top: 20px;
+            text-align: left;
+            max-height: 150px;
+            overflow-y: auto;
+            font-size: 12px;
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            border: 1px solid #eee;
+        }
+        .transcript {
+            margin-top: 10px;
+            text-align: left;
+            max-height: 150px;
+            overflow-y: auto;
+            font-size: 14px;
+            background: #fff;
+            padding: 10px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+            min-height: 50px;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .user-text { color: #007aff; font-weight: 500; }
+        .ai-text { color: #34c759; font-weight: 500; }
+        .transcript p { margin: 0; padding: 2px 0; line-height: 1.4; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Stepfun VAD</h1>
+    
+    <div class="ai-circle" id="aiCircle">AI</div>
+    
+    <div class="controls">
+        <input type="password" id="apiKey" placeholder="Stepfun API Key">
+        <button id="connectBtn" class="btn btn-primary">Connect</button>
+        <button id="vadBtn" class="btn btn-primary" disabled>Start VAD Mode</button>
+    </div>
+    
+    <div id="status" class="status status-disconnected">Disconnected</div>
+    
+    <div class="transcript" id="transcript"></div>
+    <div class="log" id="log"></div>
+</div>
+
+<script>
+    const connectBtn = document.getElementById('connectBtn');
+    const vadBtn = document.getElementById('vadBtn');
+    const apiKeyInput = document.getElementById('apiKey');
+    const statusDiv = document.getElementById('status');
+    const aiCircle = document.getElementById('aiCircle');
+    const logDiv = document.getElementById('log');
+    const transcriptDiv = document.getElementById('transcript');
+
+    let ws = null;
+    let audioContext = null;
+    let audioWorkletNode = null;
+    let microphoneStream = null;
+    let isVADActive = false;
+    let playbackBuffer = [];
+    let isPlaying = false;
+    let nextStartTime = 0;
+    let activeSources = [];
+    let currentAiTranscriptSpan = null;
+
+    function log(msg) {
+        const p = document.createElement('p');
+        p.style.margin = '2px 0';
+        p.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        logDiv.prepend(p);
+        console.log(msg);
+    }
+
+    function addTranscript(text, isAi = false) {
+        if (isAi) {
+            if (!currentAiTranscriptSpan) {
+                const p = document.createElement('p');
+                p.style.margin = '4px 0';
+                const label = document.createElement('span');
+                label.className = 'ai-text';
+                label.textContent = 'AI: ';
+                p.appendChild(label);
+                
+                currentAiTranscriptSpan = document.createElement('span');
+                currentAiTranscriptSpan.className = 'ai-text';
+                p.appendChild(currentAiTranscriptSpan);
+                transcriptDiv.appendChild(p);
+            }
+            currentAiTranscriptSpan.textContent += text;
+        } else {
+            // User transcripts are usually completed in one go
+            currentAiTranscriptSpan = null; // Reset AI span so next AI response starts fresh
+            const p = document.createElement('p');
+            p.style.margin = '4px 0';
+            const span = document.createElement('span');
+            span.className = 'user-text';
+            span.textContent = "You: " + text;
+            p.appendChild(span);
+            transcriptDiv.appendChild(p);
+        }
+        transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+    }
+
+    async function initAudio() {
+        if (!audioContext) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+            await audioContext.audioWorklet.addModule('audio-processor.js');
+        }
+        if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+        }
+    }
+
+    async function startRecording() {
+        try {
+            microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const source = audioContext.createMediaStreamSource(microphoneStream);
+            audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+            
+            audioWorkletNode.port.onmessage = (event) => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const pcmData = event.data;
+                    const base64Audio = arrayBufferToBase64(pcmData.buffer);
+                    ws.send(JSON.stringify({
+                        type: 'input_audio_buffer.append',
+                        audio: base64Audio
+                    }));
+                }
+            };
+            
+            source.connect(audioWorkletNode);
+            log("Microphone recording started");
+        } catch (err) {
+            log("Error accessing microphone: " + err);
+        }
+    }
+
+    function stopRecording() {
+        if (microphoneStream) {
+            microphoneStream.getTracks().forEach(track => track.stop());
+            microphoneStream = null;
+        }
+        if (audioWorkletNode) {
+            audioWorkletNode.disconnect();
+            audioWorkletNode = null;
+        }
+        log("Microphone recording stopped");
+    }
+
+    function arrayBufferToBase64(buffer) {
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return window.btoa(binary);
+    }
+
+    function base64ToArrayBuffer(base64) {
+        if (!base64 || typeof base64 !== 'string') {
+            return new ArrayBuffer(0);
+        }
+        try {
+            // Remove potential whitespace, newlines and fix padding
+            const cleanedBase64 = base64.replace(/[\s\n\r]/g, '');
+            const binaryString = window.atob(cleanedBase64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        } catch (e) {
+            console.error("Base64 decode error:", e, base64 ? base64.substring(0, 20) + "..." : "null");
+            return new ArrayBuffer(0);
+        }
+    }
+
+    function playAudioChunk(base64Audio) {
+        const arrayBuffer = base64ToArrayBuffer(base64Audio);
+        if (arrayBuffer.byteLength === 0) return;
+        
+        const int16Data = new Int16Array(arrayBuffer);
+        const float32Data = new Float32Array(int16Data.length);
+        
+        for (let i = 0; i < int16Data.length; i++) {
+            float32Data[i] = int16Data[i] / 32768.0;
+        }
+        
+        const audioBuffer = audioContext.createBuffer(1, float32Data.length, 24000);
+        audioBuffer.getChannelData(0).set(float32Data);
+        
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        
+        const currentTime = audioContext.currentTime;
+        if (nextStartTime < currentTime) {
+            nextStartTime = currentTime;
+        }
+        
+        source.start(nextStartTime);
+        nextStartTime += audioBuffer.duration;
+        
+        activeSources.push(source);
+        aiCircle.classList.add('ai-speaking');
+        
+        source.onended = () => {
+            activeSources = activeSources.filter(s => s !== source);
+            if (activeSources.length === 0) {
+                aiCircle.classList.remove('ai-speaking');
+            }
+        };
+    }
+
+    function interruptAudio() {
+        log("Interrupting audio playback...");
+        activeSources.forEach(source => {
+            try {
+                source.stop();
+            } catch (e) {}
+        });
+        activeSources = [];
+        nextStartTime = audioContext.currentTime;
+        aiCircle.classList.remove('ai-speaking');
+        currentAiTranscriptSpan = null; // Also reset transcript on interruption
+    }
+
+    connectBtn.onclick = async () => {
+        if (ws) {
+            ws.close();
+            return;
+        }
+
+        const apiKey = apiKeyInput.value;
+        const url = `ws://localhost:8080/ws?apiKey=${apiKey}`;
+        
+        ws = new WebSocket(url);
+        
+        ws.onopen = () => {
+            statusDiv.textContent = "Connected";
+            statusDiv.className = "status status-connected";
+            connectBtn.textContent = "Disconnect";
+            vadBtn.disabled = false;
+            log("Connected to proxy server");
+            initAudio();
+        };
+        
+        ws.onmessage = async (event) => {
+            let data;
+            try {
+                if (event.data instanceof Blob) {
+                    const text = await event.data.text();
+                    data = JSON.parse(text);
+                } else if (typeof event.data === 'string') {
+                    data = JSON.parse(event.data);
+                } else {
+                    return;
+                }
+            } catch (e) {
+                console.error("JSON parse error:", e);
+                return;
+            }
+            
+            // Handle audio deltas
+            if (data.type === 'response.audio.delta' && data.audio) {
+                playAudioChunk(data.audio);
+            } 
+            // Handle interruption
+            else if (data.type === 'server.input_audio_buffer.speech_started') {
+                log("User started speaking (Interruption detected)");
+                interruptAudio();
+            } 
+            // Handle AI transcripts
+            else if (data.type === 'response.audio_transcript.delta' && data.delta) {
+                addTranscript(data.delta, true);
+            } 
+            // Handle user transcripts (if enabled)
+            else if (data.type === 'conversation.item.input_audio_transcription.completed') {
+                addTranscript(data.transcript, false);
+            }
+            // Handle response completion
+            else if (data.type === 'response.done') {
+                log("Response finished");
+                currentAiTranscriptSpan = null; // Reset for next response
+            }
+            // Handle new response creation
+            else if (data.type === 'response.created') {
+                currentAiTranscriptSpan = null; // New response starts fresh
+                log("Event: response.created");
+            }
+            // Handle errors
+            else if (data.type === 'error') {
+                log("Server error: " + data.message);
+                if (data.error) log("Details: " + JSON.stringify(data.error));
+            } 
+            // Log other interesting events
+            else {
+                const interestingEvents = [
+                    'session.created',
+                    'session.updated',
+                    'response.created',
+                    'response.output_item.added',
+                    'conversation.item.created'
+                ];
+                if (interestingEvents.includes(data.type)) {
+                    log("Event: " + data.type);
+                }
+            }
+        };
+        
+        ws.onclose = () => {
+            statusDiv.textContent = "Disconnected";
+            statusDiv.className = "status status-disconnected";
+            connectBtn.textContent = "Connect";
+            vadBtn.disabled = true;
+            vadBtn.textContent = "Start VAD Mode";
+            isVADActive = false;
+            stopRecording();
+            ws = null;
+            log("Disconnected from proxy server");
+        };
+    };
+
+    vadBtn.onclick = async () => {
+        if (!isVADActive) {
+            // Start VAD
+            ws.send(JSON.stringify({
+                type: 'session.update',
+                session: {
+                    modalities: ["text", "audio"],
+                    turn_detection: { type: 'server_vad' },
+                    input_audio_transcription: { model: 'whisper-1' },
+                    instructions: "You are a helpful assistant. Keep your responses concise and friendly."
+                }
+            }));
+            await startRecording();
+            isVADActive = true;
+            vadBtn.textContent = "Stop VAD Mode";
+            vadBtn.className = "btn btn-danger";
+            log("VAD Mode enabled");
+        } else {
+            // Stop VAD
+            ws.send(JSON.stringify({
+                type: 'session.update',
+                session: {
+                    turn_detection: null
+                }
+            }));
+            stopRecording();
+            isVADActive = false;
+            vadBtn.textContent = "Start VAD Mode";
+            vadBtn.className = "btn btn-primary";
+            log("VAD Mode disabled");
+        }
+    };
+</script>
+
+</body>
+</html>
