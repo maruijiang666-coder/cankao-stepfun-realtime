@@ -123,10 +123,25 @@
     
     <div class="controls">
         <input type="password" id="apiKey" placeholder="Stepfun API Key">
+        <div class="mode-selector" style="margin: 10px 0;">
+            <label for="modeSelect">Mode: </label>
+            <select id="modeSelect" class="btn" style="padding: 5px; border: 1px solid #ccc;">
+                <option value="manual">Manual (Push to Talk)</option>
+                <option value="vad">Voice Activity Detection</option>
+            </select>
+        </div>
         <button id="realtimeBtn" class="btn btn-success">Realtime Talk (One-Click)</button>
         <button id="connectBtn" class="btn btn-primary">Connect</button>
-        <button id="vadBtn" class="btn btn-primary" disabled>Start VAD Mode</button>
-        <button id="manualTriggerBtn" class="btn btn-success" disabled>Commit & Response</button>
+        
+        <div id="manualControls" style="display: flex; flex-direction: column; align-items: center; gap: 10px; margin-top: 20px;">
+            <button id="pttBtn" class="btn" style="width: 100px; height: 100px; border-radius: 50%; background-color: #007aff; color: white; display: none; flex-direction: column; align-items: center; justify-content: center; user-select: none; -webkit-user-select: none;">
+                <span id="pttIcon">🎤</span>
+                <span id="pttText" style="font-size: 12px; margin-top: 5px;">Hold to Speak</span>
+            </button>
+        </div>
+
+        <button id="vadBtn" class="btn btn-primary" style="display: none;">Start VAD Mode</button>
+        <button id="manualTriggerBtn" class="btn btn-success" disabled style="display: none;">Commit & Response</button>
     </div>
     
     <div id="status" class="status status-disconnected">Disconnected</div>
@@ -146,6 +161,10 @@
     const aiCircle = document.getElementById('aiCircle');
     const logDiv = document.getElementById('log');
     const transcriptDiv = document.getElementById('transcript');
+    const modeSelect = document.getElementById('modeSelect');
+    const pttBtn = document.getElementById('pttBtn');
+    const pttIcon = document.getElementById('pttIcon');
+    const pttText = document.getElementById('pttText');
 
     let ws = null;
     let audioContext = null;
@@ -155,6 +174,9 @@
     let isVADActive = false;
     let currentAiTranscriptSpan = null;
     let autoStartVAD = false;
+    let conversationalMode = 'manual';
+    let isRecording = false;
+    let isProcessingRecording = false;
 
     function log(msg) {
         const p = document.createElement('p');
@@ -209,39 +231,63 @@
     }
 
     async function startRecording() {
+        if (isProcessingRecording) return;
+        isProcessingRecording = true;
+        isRecording = true;
+        
         try {
-            microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            const source = audioContext.createMediaStreamSource(microphoneStream);
-            audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+            interruptAudio(); // Always interrupt when starting to speak
             
-            audioWorkletNode.port.onmessage = (event) => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    const pcmData = event.data;
-                    const base64Audio = arrayBufferToBase64(pcmData.buffer);
-                    ws.send(JSON.stringify({
-                        type: 'input_audio_buffer.append',
-                        audio: base64Audio
-                    }));
-                }
-            };
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+
+            if (!microphoneStream) {
+                log("Initializing microphone...");
+                microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const source = audioContext.createMediaStreamSource(microphoneStream);
+                audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+                
+                audioWorkletNode.port.onmessage = (event) => {
+                    if (isRecording && ws && ws.readyState === WebSocket.OPEN) {
+                        const pcmData = event.data;
+                        const base64Audio = arrayBufferToBase64(pcmData.buffer);
+                        ws.send(JSON.stringify({
+                            type: 'input_audio_buffer.append',
+                            audio: base64Audio
+                        }));
+                    }
+                };
+                
+                source.connect(audioWorkletNode);
+            }
             
-            source.connect(audioWorkletNode);
-            log("Microphone recording started");
+            log("Recording active");
         } catch (err) {
             log("Error accessing microphone: " + err);
+            isRecording = false;
+        } finally {
+            isProcessingRecording = false;
         }
     }
 
-    function stopRecording() {
-        if (microphoneStream) {
-            microphoneStream.getTracks().forEach(track => track.stop());
-            microphoneStream = null;
+    function stopRecording(shouldCreateResponse = true) {
+        if (isProcessingRecording) return;
+        isProcessingRecording = true;
+        isRecording = false;
+
+        log("Recording paused");
+        
+        // If in manual mode, trigger response after stopping recording
+        if (shouldCreateResponse && conversationalMode === 'manual' && ws && ws.readyState === WebSocket.OPEN) {
+            log("PTT: Committing and requesting response...");
+            // 1. Commit the buffer first
+            ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+            // 2. Then create response
+            ws.send(JSON.stringify({ type: 'response.create' }));
         }
-        if (audioWorkletNode) {
-            audioWorkletNode.disconnect();
-            audioWorkletNode = null;
-        }
-        log("Microphone recording stopped");
+        
+        isProcessingRecording = false;
     }
 
     function arrayBufferToBase64(buffer) {
@@ -290,8 +336,91 @@
         if (wavStreamPlayer) {
             wavStreamPlayer.interrupt();
         }
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'response.cancel' }));
+        }
         aiCircle.classList.remove('ai-speaking');
         currentAiTranscriptSpan = null; 
+    }
+
+    function updateSessionMode() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        
+        conversationalMode = modeSelect.value;
+        log(`Switching to ${conversationalMode} mode...`);
+
+        const sessionConfig = {
+            modalities: ["text", "audio"],
+            input_audio_format: "pcm16",
+            output_audio_format: "pcm16",
+            input_audio_transcription: { model: 'whisper-1' },
+            instructions: "你是一个有用的人工智能助手。请务必使用中文回答用户的问题，除非用户明确要求使用其他语言。保持回答简洁、友好且专业。"
+        };
+
+        if (conversationalMode === 'manual') {
+            pttBtn.style.display = 'flex';
+            vadBtn.style.display = 'none';
+            stopRecording(false); // Don't trigger response when switching modes
+            ws.send(JSON.stringify({
+                type: 'session.update',
+                session: {
+                    ...sessionConfig,
+                    turn_detection: null
+                }
+            }));
+        } else {
+            pttBtn.style.display = 'none';
+            vadBtn.style.display = 'block';
+            ws.send(JSON.stringify({
+                type: 'session.update',
+                session: {
+                    ...sessionConfig,
+                    turn_detection: { type: 'server_vad' }
+                }
+            }));
+            // In VAD mode, we usually start recording immediately
+            startRecording();
+        }
+    }
+
+    modeSelect.onchange = updateSessionMode;
+
+    // PTT Event Listeners
+    pttBtn.onmousedown = (e) => {
+        e.preventDefault();
+        if (conversationalMode === 'manual') {
+            pttBtn.style.backgroundColor = '#34c759';
+            pttText.textContent = 'Recording...';
+            startRecording();
+        }
+    };
+
+    const handlePTTRelease = (e) => {
+        e.preventDefault();
+        if (conversationalMode === 'manual' && isRecording) {
+            pttBtn.style.backgroundColor = '#007aff';
+            pttText.textContent = 'Hold to Speak';
+            stopRecording();
+        }
+    };
+
+    pttBtn.onmouseup = handlePTTRelease;
+    pttBtn.onmouseleave = handlePTTRelease;
+
+    // Touch support for mobile
+    pttBtn.ontouchstart = (e) => {
+        e.preventDefault();
+        if (conversationalMode === 'manual') {
+            pttBtn.style.backgroundColor = '#34c759';
+            pttText.textContent = 'Recording...';
+            startRecording();
+        }
+    };
+    pttBtn.ontouchend = handlePTTRelease;
+    pttBtn.ontouchcancel = handlePTTRelease;
+
+    async function toggleMode() {
+        updateSessionMode();
     }
 
     async function connect() {
@@ -321,8 +450,12 @@
             log("Connected to proxy server");
             await initAudio();
 
+            // Initialize session based on selected mode
+            updateSessionMode();
+
             if (autoStartVAD) {
-                await startVADMode();
+                modeSelect.value = 'vad';
+                await toggleMode();
                 autoStartVAD = false;
             }
         };
@@ -410,51 +543,40 @@
             manualTriggerBtn.disabled = true;
             vadBtn.textContent = "Start VAD Mode";
             isVADActive = false;
-            stopRecording();
+            stopRecording(false); // Don't trigger response on disconnect
+            cleanupMicrophone(); // Fully stop microphone on disconnect
             interruptAudio();
             ws = null;
             log("Disconnected from proxy server");
         };
     }
 
+    function cleanupMicrophone() {
+        if (microphoneStream) {
+            log("Stopping microphone...");
+            microphoneStream.getTracks().forEach(track => track.stop());
+            microphoneStream = null;
+        }
+        if (audioWorkletNode) {
+            audioWorkletNode.disconnect();
+            audioWorkletNode = null;
+        }
+    }
+
     connectBtn.onclick = connect;
 
     realtimeBtn.onclick = async () => {
         if (ws) {
-            // 1. Stop VAD if active
-            if (isVADActive) {
-                stopVADMode();
-            }
-            // 2. Stop audio and recording immediately
-            stopRecording();
+            // 1. Stop audio and recording immediately
+            stopRecording(false); // Don't trigger response
             interruptAudio();
-            // 3. Close WebSocket
+            // 2. Close WebSocket
             ws.close();
         } else {
             autoStartVAD = true;
             await connect();
         }
     };
-
-    async function startVADMode() {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        
-        ws.send(JSON.stringify({
-            type: 'session.update',
-            session: {
-                modalities: ["text", "audio"],
-                turn_detection: { type: 'server_vad' },
-                input_audio_format: "pcm16",
-                output_audio_format: "pcm16",
-                instructions: "You are a helpful assistant. Keep your responses concise and friendly."
-            }
-        }));
-        await startRecording();
-        isVADActive = true;
-        vadBtn.textContent = "Stop VAD Mode";
-        vadBtn.className = "btn btn-danger";
-        log("VAD Mode enabled with improved config");
-    }
 
     manualTriggerBtn.onclick = () => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -469,30 +591,6 @@
         ws.send(JSON.stringify({
             type: 'response.create'
         }));
-    };
-
-    function stopVADMode() {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-        ws.send(JSON.stringify({
-            type: 'session.update',
-            session: {
-                turn_detection: null
-            }
-        }));
-        stopRecording();
-        isVADActive = false;
-        vadBtn.textContent = "Start VAD Mode";
-        vadBtn.className = "btn btn-primary";
-        log("VAD Mode disabled");
-    }
-
-    vadBtn.onclick = async () => {
-        if (!isVADActive) {
-            await startVADMode();
-        } else {
-            stopVADMode();
-        }
     };
 </script>
 
