@@ -27,6 +27,8 @@ API_KEY = os.getenv("API_KEY", "")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    client_host = websocket.client.host
+    print(f"[{client_host}] Client connected to proxy")
     
     # Get parameters from query string
     params = websocket.query_params
@@ -71,14 +73,28 @@ async def websocket_endpoint(websocket: WebSocket):
                             if stop_event.is_set():
                                 break
                             if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                msg_type = data.get("type", "unknown")
+                                if msg_type in ["response.audio.delta", "server.response.audio.delta"]:
+                                    delta = data.get("delta") or data.get("audio", "")
+                                    print(f"[{client_host}] Stepfun -> Client: {msg_type} (audio size: {len(delta)})")
+                                elif msg_type == "error":
+                                    print(f"[{client_host}] Stepfun -> Client ERROR: {json.dumps(data, indent=2)}")
+                                else:
+                                    print(f"[{client_host}] Stepfun -> Client: {msg_type}")
+                                    # Log full data for session events or other important events
+                                    if msg_type.startswith("session.") or msg_type.startswith("response."):
+                                         print(f"[{client_host}] Event details: {json.dumps(data, indent=2)}")
                                 await websocket.send_text(msg.data)
                             elif msg.type == aiohttp.WSMsgType.BINARY:
+                                print(f"[{client_host}] Stepfun -> Client: BINARY (size: {len(msg.data)})")
                                 await websocket.send_bytes(msg.data)
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                print(f"[{client_host}] Stepfun connection closed: {msg.type}")
                                 break
                     except Exception as e:
                         if not stop_event.is_set():
-                            print(f"Error forwarding to client: {e}")
+                            print(f"[{client_host}] Error forwarding to client: {e}")
                     finally:
                         stop_event.set()
 
@@ -88,16 +104,29 @@ async def websocket_endpoint(websocket: WebSocket):
                             try:
                                 message = await asyncio.wait_for(websocket.receive(), timeout=1.0)
                                 if "text" in message:
-                                    await stepfun_ws.send_str(message["text"])
+                                    text_data = message["text"]
+                                    try:
+                                        data = json.loads(text_data)
+                                        msg_type = data.get("type", "unknown")
+                                        if msg_type == "input_audio_buffer.append":
+                                            audio = data.get("audio", "")
+                                            print(f"[{client_host}] Client -> Stepfun: {msg_type} (audio size: {len(audio)})")
+                                        else:
+                                            print(f"[{client_host}] Client -> Stepfun: {msg_type}")
+                                    except:
+                                        print(f"[{client_host}] Client -> Stepfun: Raw Text")
+                                    await stepfun_ws.send_str(text_data)
                                 elif "bytes" in message:
+                                    print(f"[{client_host}] Client -> Stepfun: BINARY (size: {len(message['bytes'])})")
                                     await stepfun_ws.send_bytes(message["bytes"])
                                 elif message["type"] == "websocket.disconnect":
+                                    print(f"[{client_host}] Client disconnected from proxy")
                                     break
                             except asyncio.TimeoutError:
                                 continue
                     except Exception as e:
                         if not stop_event.is_set():
-                            print(f"Error forwarding to Stepfun: {e}")
+                            print(f"[{client_host}] Error forwarding to Stepfun: {e}")
                     finally:
                         stop_event.set()
 

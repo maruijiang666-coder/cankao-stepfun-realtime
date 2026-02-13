@@ -126,6 +126,7 @@
         <button id="realtimeBtn" class="btn btn-success">Realtime Talk (One-Click)</button>
         <button id="connectBtn" class="btn btn-primary">Connect</button>
         <button id="vadBtn" class="btn btn-primary" disabled>Start VAD Mode</button>
+        <button id="manualTriggerBtn" class="btn btn-success" disabled>Commit & Response</button>
     </div>
     
     <div id="status" class="status status-disconnected">Disconnected</div>
@@ -138,6 +139,7 @@
 <script>
     const connectBtn = document.getElementById('connectBtn');
     const vadBtn = document.getElementById('vadBtn');
+    const manualTriggerBtn = document.getElementById('manualTriggerBtn');
     const realtimeBtn = document.getElementById('realtimeBtn');
     const apiKeyInput = document.getElementById('apiKey');
     const statusDiv = document.getElementById('status');
@@ -315,6 +317,7 @@
             realtimeBtn.textContent = "Stop Realtime Talk";
             realtimeBtn.className = "btn btn-danger";
             vadBtn.disabled = false;
+            manualTriggerBtn.disabled = false;
             log("Connected to proxy server");
             await initAudio();
 
@@ -372,9 +375,14 @@
             }
             // Handle errors
             else if (data.type === 'error') {
-                log("Server error: " + data.message);
+                const errMsg = data.message || (data.error && data.error.message) || "Unknown error";
+                log("Server error: " + errMsg);
                 if (data.error) log("Details: " + JSON.stringify(data.error));
             } 
+            // Log session.created to see default config
+            else if (data.type === 'session.created') {
+                log("Session created. Default config: " + JSON.stringify(data.session));
+            }
             // Log other interesting events
             else {
                 const interestingEvents = [
@@ -399,6 +407,7 @@
             realtimeBtn.textContent = "Realtime Talk (One-Click)";
             realtimeBtn.className = "btn btn-success";
             vadBtn.disabled = true;
+            manualTriggerBtn.disabled = true;
             vadBtn.textContent = "Start VAD Mode";
             isVADActive = false;
             stopRecording();
@@ -435,7 +444,8 @@
             session: {
                 modalities: ["text", "audio"],
                 turn_detection: { type: 'server_vad' },
-                input_audio_transcription: { model: 'whisper-1' },
+                input_audio_format: "pcm16",
+                output_audio_format: "pcm16",
                 instructions: "You are a helpful assistant. Keep your responses concise and friendly."
             }
         }));
@@ -443,8 +453,23 @@
         isVADActive = true;
         vadBtn.textContent = "Stop VAD Mode";
         vadBtn.className = "btn btn-danger";
-        log("VAD Mode enabled");
+        log("VAD Mode enabled with improved config");
     }
+
+    manualTriggerBtn.onclick = () => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        
+        log("Manually triggering response...");
+        // 1. Commit the current audio buffer
+        ws.send(JSON.stringify({
+            type: 'input_audio_buffer.commit'
+        }));
+        
+        // 2. Request a response
+        ws.send(JSON.stringify({
+            type: 'response.create'
+        }));
+    };
 
     function stopVADMode() {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
