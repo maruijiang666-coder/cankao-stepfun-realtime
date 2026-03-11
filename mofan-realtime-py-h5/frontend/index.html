@@ -435,7 +435,9 @@
             autoStartVAD = false; // Reset if failed
             return;
         }
-        const url = `ws://localhost:8080/ws?apiKey=${apiKey}`;
+        // const url = `ws://localhost:8080/ws?apiKey=${apiKey}`;
+        // 远程服务器的连接地址
+         const url = `wss://wanda.tangledup-ai.com/backend/ws?apiKey=${apiKey}`;
         
         ws = new WebSocket(url);
         

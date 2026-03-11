@@ -43,10 +43,16 @@ get_activities_tool = {
     "type": "function",
     "function": {
         "name": "get_activities",
-        "description": "获取万达双塔的活动列表。可以根据特定条件筛选活动。",
+        "description": "获取万达双塔的活动列表。默认获取未过期的活动。如果需要查询历史活动，请指定 scope 参数。",
         "parameters": {
             "type": "object",
             "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["unexpired", "all"],
+                    "default": "unexpired",
+                    "description": "默认为 'unexpired' (未过期活动)。仅在用户明确询问'历史活动'、'过期活动'或'往期活动'时设置为 'all'。"
+                },
                 "search": {
                     "type": "string",
                     "description": "搜索关键词，例如活动标题或内容"
@@ -75,8 +81,18 @@ get_activities_tool = {
 
 async def get_activities_handler(args):
     print(f"🎉 调用活动API: {args}")
+    scope = args.get('scope', 'unexpired')
+    
+    # Clean up args for API call
+    api_params = args.copy()
+    if 'scope' in api_params:
+        del api_params['scope']
+
     try:
-        data = await fetch_json('https://wanda.tangledup-ai.com/api/activities/activities/', args)
+        if scope == 'all':
+            data = await fetch_json('https://wanda.tangledup-ai.com/api/activities/activities/', api_params)
+        else:
+            data = await fetch_json('https://wanda.tangledup-ai.com/api/activities/activities/unexpired/', api_params)
         return create_success_response(data)
     except Exception as e:
         return create_error_response(e)
