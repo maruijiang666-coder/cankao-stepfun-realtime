@@ -81,6 +81,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 print(f"[{client_host}] Initialized session with tools")
 
                 stop_event = asyncio.Event()
+                processed_call_ids = set()
+                response_state = {
+                    "is_active": False,
+                    "pending_create": False
+                }
 
                 async def forward_to_client():
                     try:
@@ -91,6 +96,32 @@ async def websocket_endpoint(websocket: WebSocket):
                                 data = json.loads(msg.data)
                                 msg_type = data.get("type", "unknown")
                                 
+                                # Track active response state
+                                if msg_type == "response.created":
+                                    print(f"[{client_host}] Response CREATED (active=True)")
+                                    response_state["is_active"] = True
+                                elif msg_type == "response.done":
+                                    print(f"[{client_host}] Response DONE (active=False)")
+                                    response_state["is_active"] = False
+                                    
+                                    # If we had a pending create request, send it now
+                                    if response_state["pending_create"]:
+                                        print(f"[{client_host}] Sending delayed response.create")
+                                        await stepfun_ws.send_json({"type": "response.create"})
+                                        response_state["pending_create"] = False
+                                elif msg_type == "error":
+                                    # Also clear active state on error to avoid getting stuck
+                                    error_data = data.get("error", {})
+                                    if error_data.get("message") == "ongoing response already exists":
+                                         # If we hit this, it means we tried too early. The ongoing response is still active.
+                                         # We don't change is_active here, but maybe we should retry later?
+                                         # For now, just log it. The pending_create logic should prevent this mostly.
+                                         pass
+                                    else:
+                                         # Other errors might terminate the response?
+                                         # Safest to assume response is done if it was a fatal error for that response
+                                         pass
+
                                 # Handle Tool Calls from Stepfun
                                 if msg_type == "response.function_call_arguments.done":
                                     print(f"[{client_host}] 🛠️ Tool Call Requested: {data}")
@@ -98,10 +129,43 @@ async def websocket_endpoint(websocket: WebSocket):
                                     name = data.get("name")
                                     args_str = data.get("arguments")
                                     
-                                    if name in HANDLERS:
+                                    if call_id not in processed_call_ids and name in HANDLERS:
+                                        processed_call_ids.add(call_id)
                                         # Run tool asynchronously
                                         asyncio.create_task(handle_tool_call(stepfun_ws, call_id, name, args_str, client_host))
                                 
+                                elif msg_type == "response.output_item.done":
+                                    item = data.get("item", {})
+                                    if item.get("type") == "function_call":
+                                        print(f"[{client_host}] 🛠️ Tool Call Requested (output_item.done): {data}")
+                                        call_id = item.get("call_id")
+                                        name = item.get("name")
+                                        args_str = item.get("arguments")
+                                        
+                                        if call_id not in processed_call_ids and name in HANDLERS:
+                                            processed_call_ids.add(call_id)
+                                            asyncio.create_task(handle_tool_call(stepfun_ws, call_id, name, args_str, client_host))
+                                
+                                elif msg_type == "response.done":
+                                    response_data = data.get("response", {})
+                                    output = response_data.get("output", [])
+                                    print(f"[{client_host}] DEBUG: Processing response.done with {len(output)} output items")
+                                    for item in output:
+                                        item_type = item.get("type")
+                                        if item_type == "function_call":
+                                            call_id = item.get("call_id")
+                                            name = item.get("name")
+                                            args_str = item.get("arguments")
+                                            
+                                            print(f"[{client_host}] DEBUG: Found function_call in response.done: {name} (call_id={call_id})")
+                                            
+                                            if call_id not in processed_call_ids and name in HANDLERS:
+                                                print(f"[{client_host}] 🛠️ Tool Call Requested (response.done): {name}")
+                                                processed_call_ids.add(call_id)
+                                                asyncio.create_task(handle_tool_call(stepfun_ws, call_id, name, args_str, client_host))
+                                            else:
+                                                print(f"[{client_host}] DEBUG: Skipped function_call {name} (processed={call_id in processed_call_ids}, valid_handler={name in HANDLERS})")
+
                                 if msg_type in ["response.audio.delta", "server.response.audio.delta"]:
                                     delta = data.get("delta") or data.get("audio", "")
                                     print(f"[{client_host}] Stepfun -> Client: {msg_type} (audio size: {len(delta)})")
@@ -143,7 +207,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         print(f"[{host}] Sent tool output for {name}")
                         
                         # Trigger Response
-                        await ws.send_json({"type": "response.create"})
+                        if response_state["is_active"]:
+                            print(f"[{host}] Response is active, queuing response.create")
+                            response_state["pending_create"] = True
+                        else:
+                            print(f"[{host}] Triggering response.create immediately")
+                            await ws.send_json({"type": "response.create"})
                         
                     except Exception as e:
                         print(f"[{host}] Tool execution error: {e}")

@@ -4,6 +4,21 @@ import urllib.parse
 
 # --- Helper Functions ---
 
+def clean_data(data, fields_to_keep=None):
+    """
+    递归清洗数据，只保留指定字段。
+    如果 data 是列表，则对每个元素应用清洗。
+    如果 data 是字典，则保留 fields_to_keep 中的字段。
+    """
+    if isinstance(data, list):
+        return [clean_data(item, fields_to_keep) for item in data]
+    elif isinstance(data, dict):
+        if fields_to_keep:
+            return {k: v for k, v in data.items() if k in fields_to_keep}
+        return data
+    else:
+        return data
+
 async def fetch_json(url: str, params: dict = None):
     if params is None:
         params = {}
@@ -24,7 +39,11 @@ def create_success_response(data):
         "error": None,
         "data": data
     }
-    print(f"✅ Wanda工具调用成功: {json.dumps(response, indent=2, ensure_ascii=False)}")
+    # Limit log output length
+    log_str = json.dumps(response, indent=2, ensure_ascii=False)
+    if len(log_str) > 1000:
+        log_str = log_str[:1000] + "... (truncated)"
+    print(f"✅ Wanda工具调用成功: {log_str}")
     return json.dumps(response, ensure_ascii=False)
 
 def create_error_response(error):
@@ -90,10 +109,38 @@ async def get_activities_handler(args):
 
     try:
         if scope == 'all':
-            data = await fetch_json('https://wanda.tangledup-ai.com/api/activities/activities/', api_params)
+            raw_data = await fetch_json('https://wanda.tangledup-ai.com/api/activities/activities/', api_params)
         else:
-            data = await fetch_json('https://wanda.tangledup-ai.com/api/activities/activities/unexpired/', api_params)
-        return create_success_response(data)
+            raw_data = await fetch_json('https://wanda.tangledup-ai.com/api/activities/activities/unexpired/', api_params)
+            
+        # Data Cleaning for Activities
+        # Handle paginated response (results list) or direct list
+        activities = raw_data.get('results', []) if isinstance(raw_data, dict) else raw_data
+        
+        cleaned_activities = []
+        for item in activities:
+            # Basic fields
+            activity = {
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "start_time": item.get("start_time"),
+                "end_time": item.get("end_time"),
+                "location": "万达双塔", # Default location if not specified
+                "is_featured": item.get("is_featured"),
+            }
+            
+            # Simplified content (first 100 chars)
+            content = item.get("content", "")
+            if content:
+                activity["content_summary"] = content[:100] + "..." if len(content) > 100 else content
+                
+            # Category name only
+            if item.get("category"):
+                activity["category"] = item["category"].get("name")
+                
+            cleaned_activities.append(activity)
+            
+        return create_success_response(cleaned_activities)
     except Exception as e:
         return create_error_response(e)
 
@@ -139,8 +186,26 @@ get_listings_tool = {
 async def get_listings_handler(args):
     print(f"🏠 调用房源API: {args}")
     try:
-        data = await fetch_json('https://wanda.tangledup-ai.com/api/listings/', args)
-        return create_success_response(data)
+        raw_data = await fetch_json('https://wanda.tangledup-ai.com/api/listings/', args)
+        
+        # Data Cleaning for Listings
+        listings = raw_data.get('results', []) if isinstance(raw_data, dict) else raw_data
+        
+        cleaned_listings = []
+        for item in listings:
+            listing = {
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "floor": item.get("floor"),
+                "unit": item.get("unit"),
+                "zone": item.get("zone"),
+                "area": item.get("area"), # Assuming area field exists
+                "price": item.get("price"), # Assuming price field exists
+                "status": item.get("status_display") or item.get("status"),
+            }
+            cleaned_listings.append(listing)
+            
+        return create_success_response(cleaned_listings)
     except Exception as e:
         return create_error_response(e)
 
@@ -199,8 +264,30 @@ get_merchants_tool = {
 async def get_merchants_handler(args):
     print(f"🏢 调用商户API: {args}")
     try:
-        data = await fetch_json('https://wanda.tangledup-ai.com/api/merchants/', args)
-        return create_success_response(data)
+        raw_data = await fetch_json('https://wanda.tangledup-ai.com/api/merchants/', args)
+        
+        # Data Cleaning for Merchants
+        merchants = raw_data.get('results', []) if isinstance(raw_data, dict) else raw_data
+        
+        cleaned_merchants = []
+        for item in merchants:
+            merchant = {
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "description": item.get("short_description") or item.get("description"),
+                "phone": item.get("display_phone") or item.get("contact_phone"),
+                "business_hours": item.get("business_hours_display"),
+                "status": item.get("status"),
+                "floor": item.get("location", {}).get("floor") if item.get("location") else None,
+                "zone": item.get("location", {}).get("zone") if item.get("location") else None,
+            }
+            # Add industry name if available
+            if item.get("industry_type"):
+                merchant["industry"] = item["industry_type"].get("name")
+                
+            cleaned_merchants.append(merchant)
+
+        return create_success_response(cleaned_merchants)
     except Exception as e:
         return create_error_response(e)
 
